@@ -74,10 +74,15 @@ const fetchPackageVersions = async (pkgNames) => {
 program.command('install')
     .description('Uses npm to install packages passed into argument')
     .argument('[pkgs...]', 'Packages to install (string array)')
-    .action(async (pkgs) => {
+    .option('--verbose', 'Write vulnerability report of installed packages in a JSON file within cwd')
+    .action(async (pkgs, options) => {
         const isDefaultInstall = !pkgs || pkgs.length === 0;
         let packagesToCheck = [];
 
+        if (options.verbose) {
+            const reportPath = path.normalize(`${process.cwd()}/.safepm/vulnsReport.json`);
+            await fs.writeFile(reportPath, "data") //keep "data" for now...
+        }
         // 1. Preparation Phase
         const prepSpinner = ora('Preparing package list...').start();
 
@@ -105,14 +110,26 @@ program.command('install')
                 securitySpinner.warn(chalk.yellow.bold(`Found vulnerabilities in ${foundVulns.length} packages!`));
 
                 foundVulns.forEach(v => {
-                    console.log(chalk.dim(`   - ${v.originalPkg.name}: ${v.vulns.length} issue(s)`));
+                    console.log(chalk.bold.underline(`\n📦 Package: ${v.originalPkg.name}`));
+
+                    v.vulns.forEach(vuln => {
+                        // 1. Try to get explicit severity string (common in GitHub Advisories)
+                        let severity = vuln.database_specific?.severity || "UNKNOWN";
+
+                        // 2. Color code based on severity
+                        let severityColor = chalk.white;
+                        if (severity === "CRITICAL") severityColor = chalk.bgRed.white.bold;
+                        else if (severity === "HIGH") severityColor = chalk.red;
+                        else if (severity === "MODERATE") severityColor = chalk.yellow;
+                        else if (severity === "LOW") severityColor = chalk.blue;
+
+                        console.log(`   • [${severityColor(severity)}] ${vuln.summary || "No summary available"}`);
+                        console.log(chalk.dim(`     ID: ${vuln.id}`));
+                    });
                 });
 
-                // --- NEW CODE: EXIT HERE ---
                 console.log(chalk.red.bold("\n🛑 Aborting installation due to security risks."));
-                process.exit(1); // Stops the script immediately. NPM install will NOT run.
-                // ---------------------------
-
+                process.exit(1);
             } else {
                 securitySpinner.succeed(chalk.green("No known vulnerabilities found."));
             }
