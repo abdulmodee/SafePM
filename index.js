@@ -3,12 +3,27 @@ import { Command } from "commander";
 import chalk from "chalk";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { select } from '@inquirer/prompts';
 import { exec as execCallback, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import ora from "ora"; // Import ora
+import ora from "ora";
 
 const exec = promisify(execCallback);
 const program = new Command();
+
+// --- Helper Functions ---
+
+// NEW: Helper to uninstall packages
+const uninstallPackages = async (pkgNames) => {
+    const spinner = ora(`Uninstalling ${pkgNames.length} vulnerable packages...`).start();
+    try {
+        await exec(`npm uninstall ${pkgNames.join(' ')}`);
+        spinner.succeed(chalk.green(`Successfully uninstalled: ${pkgNames.join(', ')}`));
+    } catch (error) {
+        spinner.fail(chalk.red("Failed to uninstall packages."));
+        console.error(error);
+    }
+};
 
 const extractPkgNames = async () => {
     try {
@@ -16,21 +31,31 @@ const extractPkgNames = async () => {
         const data = await fs.readFile(packageJsonPath, "utf-8");
         const json = JSON.parse(data);
         const deps = { ...json.dependencies, ...json.devDependencies };
-
         return Object.entries(deps).map(([name, version]) => ({ name, version }));
     } catch (error) {
         return [];
     }
 };
 
+const fetchPackageVersions = async (pkgNames) => {
+    const promises = pkgNames.map(async (rawArg) => {
+        try {
+            const { stdout } = await exec(`npm view ${rawArg} name version --json`);
+            const info = JSON.parse(stdout);
+            return { name: info.name, version: info.version };
+        } catch (error) {
+            return null;
+        }
+    });
+    const results = await Promise.all(promises);
+    return results.filter(item => item !== null);
+};
+
 const vulnsCheck = async (pkgList) => {
     try {
         const queries = pkgList.map(({ name, version }) => ({
             version: version.replace('^', '').replace('~', ''),
-            package: {
-                name,
-                ecosystem: "npm"
-            }
+            package: { name, ecosystem: "npm" }
         }));
 
         const response = await fetch('https://api.osv.dev/v1/querybatch', {
@@ -39,120 +64,137 @@ const vulnsCheck = async (pkgList) => {
             body: JSON.stringify({ queries })
         });
 
-        if (!response.ok) {
-            throw new Error(`API Error: ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        return data;
+        if (!response.ok) throw new Error(response.statusText);
+        return await response.json();
     } catch (error) {
-        // console.error("Failed to check vulnerabilities:", error); // Let the spinner handle errors
         return null;
     }
 };
 
-const fetchPackageVersions = async (pkgNames) => {
-    const promises = pkgNames.map(async (rawArg) => {
-        try {
-            // We ask npm for both 'name' and 'version' in JSON format.
-            // This handles cases like 'lodash@4.17.15' -> name: 'lodash', version: '4.17.15'
-            const { stdout } = await exec(`npm view ${rawArg} name version --json`);
-            const info = JSON.parse(stdout);
+// --- Reusable Reporting Logic ---
+// CHANGED: Added 'async' and 'isScan' parameter
+const processVulnerabilityReport = async (vulnResults, packagesToCheck, spinner, isScan) => {
+    if (!vulnResults || !vulnResults.results) {
+        spinner.fail(chalk.red("Failed to check vulnerabilities (API error)."));
+        return false;
+    }
 
-            // Handle edge case where npm returns a single string or array if multiple versions match (rare with specific tag)
-            // But usually --json with specific arg returns an object.
-            return { name: info.name, version: info.version };
-        } catch (error) {
-            return null;
+    const foundVulns = vulnResults.results
+        .map((r, i) => ({ ...r, originalPkg: packagesToCheck[i] }))
+        .filter(r => r.vulns);
+
+    if (foundVulns.length > 0) {
+        spinner.warn(chalk.yellow.bold(`Found vulnerabilities in ${foundVulns.length} packages!`));
+
+        foundVulns.forEach(v => {
+            console.log(chalk.bold.underline(`\n📦 Package: ${v.originalPkg.name}`));
+            v.vulns.forEach(vuln => {
+                const severity = vuln.database_specific?.severity || "UNKNOWN";
+                let severityColor = chalk.white;
+
+                if (severity === "CRITICAL") severityColor = chalk.bgRed.white.bold;
+                else if (severity === "HIGH") severityColor = chalk.red;
+                else if (severity === "MODERATE") severityColor = chalk.yellow;
+                else if (severity === "LOW") severityColor = chalk.blue;
+
+                console.log(`   • [${severityColor(severity)}] ${vuln.summary || "No summary available"}`);
+                console.log(chalk.dim(`     ID: ${vuln.id}`));
+            });
+        });
+
+        // NEW: Logic for Scan vs Install
+        if (isScan) {
+            const action = await select({
+                message: 'Vulnerabilities found during scan. How do you want to proceed?',
+                choices: [
+                    {
+                        name: "Uninstall Vulnerable Package(s)",
+                        value: "uninstall",
+                        description: "Remove these packages from your project"
+                    },
+                    {
+                        name: "Ignore & Exit",
+                        value: "ignore",
+                        description: "Do nothing"
+                    }
+                ]
+            });
+
+            if (action === 'uninstall') {
+                const pkgsToRemove = foundVulns.map(v => v.originalPkg.name);
+                await uninstallPackages(pkgsToRemove);
+                process.exit(0);
+            }
+        } else {
+            // Install Mode
+            const action = await select({
+                message: 'Vulnerabilities found. How do you want to proceed?',
+                choices: [
+                    { name: "Abort Installation (Recommended)", value: "abort" },
+                    { name: "Ignore & Install (Risky)", value: "ignore" }
+                ]
+            });
+
+            if (action === 'abort') {
+                console.log(chalk.red.bold("\n🛑 Aborting due to security risks."));
+                process.exit(1);
+            }
         }
-    });
-
-    const results = await Promise.all(promises);
-    return results.filter(item => item !== null);
+    } else {
+        spinner.succeed(chalk.green("No known vulnerabilities found."));
+    }
+    return true;
 };
+
+// --- CLI Definition ---
 
 program.command('install')
     .description('Uses npm to install packages passed into argument')
     .argument('[pkgs...]', 'Packages to install (string array)')
     .option('--verbose', 'Write vulnerability report of installed packages in a JSON file within cwd')
+    .option('--scan', 'Scans package.json for vulnerabilities without installation.')
     .action(async (pkgs, options) => {
         const isDefaultInstall = !pkgs || pkgs.length === 0;
         let packagesToCheck = [];
 
-        if (options.verbose) {
-            const reportPath = path.normalize(`${process.cwd()}/.safepm/vulnsReport.json`);
-            await fs.writeFile(reportPath, "data") //keep "data" for now...
-        }
-        // 1. Preparation Phase
-        const prepSpinner = ora('Preparing package list...').start();
+        const spinner = ora('Preparing...').start();
 
-        if (isDefaultInstall) {
-            prepSpinner.text = "Reading package.json...";
+        if (options.scan || isDefaultInstall) {
+            spinner.text = "Reading package.json...";
             packagesToCheck = await extractPkgNames();
-        } else {
-            prepSpinner.text = `Fetching latest versions for ${pkgs.length} packages...`;
-            packagesToCheck = await fetchPackageVersions(pkgs);
-        }
-        prepSpinner.succeed(chalk.blue("Package list prepared."));
-
-        // 2. Security Check Phase
-        const securitySpinner = ora('Checking for security vulnerabilities...').start();
-        const vulnResults = await vulnsCheck(packagesToCheck);
-
-        if (vulnResults && vulnResults.results) {
-            // The 'results' array maps 1:1 to your 'packagesToCheck' array.
-            // We can use the index to get the package name from your original list.
-            const foundVulns = vulnResults.results
-                .map((r, i) => ({ ...r, originalPkg: packagesToCheck[i] })) // Attach original package info
-                .filter(r => r.vulns);
-
-            if (foundVulns.length > 0) {
-                securitySpinner.warn(chalk.yellow.bold(`Found vulnerabilities in ${foundVulns.length} packages!`));
-
-                foundVulns.forEach(v => {
-                    console.log(chalk.bold.underline(`\n📦 Package: ${v.originalPkg.name}`));
-
-                    v.vulns.forEach(vuln => {
-                        // 1. Try to get explicit severity string (common in GitHub Advisories)
-                        let severity = vuln.database_specific?.severity || "UNKNOWN";
-
-                        // 2. Color code based on severity
-                        let severityColor = chalk.white;
-                        if (severity === "CRITICAL") severityColor = chalk.bgRed.white.bold;
-                        else if (severity === "HIGH") severityColor = chalk.red;
-                        else if (severity === "MODERATE") severityColor = chalk.yellow;
-                        else if (severity === "LOW") severityColor = chalk.blue;
-
-                        console.log(`   • [${severityColor(severity)}] ${vuln.summary || "No summary available"}`);
-                        console.log(chalk.dim(`     ID: ${vuln.id}`));
-                    });
-                });
-
-                console.log(chalk.red.bold("\n🛑 Aborting installation due to security risks."));
-                process.exit(1);
-            } else {
-                securitySpinner.succeed(chalk.green("No known vulnerabilities found."));
+            if (packagesToCheck.length === 0) {
+                spinner.fail("No packages found in package.json or file missing.");
+                return;
             }
         } else {
-            securitySpinner.fail(chalk.red("Failed to check vulnerabilities (API error)."));
+            spinner.text = `Fetching versions for ${pkgs.length} packages...`;
+            packagesToCheck = await fetchPackageVersions(pkgs);
+        }
+        spinner.succeed(chalk.blue(`Prepared list of ${packagesToCheck.length} packages.`));
+
+        spinner.start('Checking for security vulnerabilities...');
+        const vulnResults = await vulnsCheck(packagesToCheck);
+
+        // CHANGED: Added await and passed options.scan
+        await processVulnerabilityReport(vulnResults, packagesToCheck, spinner, options.scan);
+
+        if (options.scan) {
+            console.log(chalk.dim("\nScan complete."));
+            return;
         }
 
-        // 3. Installation Phase
         console.log(chalk.dim("\n--- Handing over to NPM ---"));
         const child = spawn("npm", ["install", ...pkgs], {
             stdio: ["inherit", "inherit", "pipe"]
         });
 
         let errorMessage = "";
-
         child.stderr.on("data", (chunk) => {
             errorMessage += chunk.toString();
             process.stderr.write(chunk);
         });
 
-        child.on('error', error => console.log(chalk.red('An error occured: '), error));
-
-        child.on("close", async code => {
+        child.on("close", (code) => {
             if (code === 0) {
                 const names = packagesToCheck.map(p => p.name).join(", ");
                 console.log("\n" + chalk.bgGreen.black(" SUCCESS ") + " " + chalk.green(`Installed successfully!`));
